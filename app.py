@@ -1,120 +1,121 @@
-# VERSIONE: 1.0 (PROGETTO CHILOMETRI - Base Basiliano)
+# VERSIONE: 1.0 (PROGETTO CHILOMETRI - Logica Giro Visite)
 import streamlit as st
 import pandas as pd
 import datetime
 import requests
 from io import StringIO
 
-# --- CONFIGURAZIONE E DISTANZE (Esempio Database) ---
+# --- CONFIGURAZIONE ---
 CASA_BASE = "BASILIANO"
 DRIVE_URL = "https://drive.google.com/uc?export=download&id=1n4b33BgWxIUDWm4xuDnhjICPkqGWi2po"
 
-# Tabella distanze approssimative da/per Basiliano e tra città comuni (in km)
-# Potremo espandere questa tabella o usare un'API in futuro
-distanze_db = {
-    ("BASILIANO", "UDINE"): 13, ("UDINE", "BASILIANO"): 13,
-    ("BASILIANO", "TRIESTE"): 75, ("TRIESTE", "BASILIANO"): 75,
-    ("BASILIANO", "CERVIGNANO"): 35, ("CERVIGNANO", "BASILIANO"): 35,
-    ("UDINE", "TRIESTE"): 70, ("TRIESTE", "UDINE"): 70,
-    ("UDINE", "CERVIGNANO"): 30, ("CERVIGNANO", "UDINE"): 30,
-    ("TRIESTE", "CERVIGNANO"): 50, ("CERVIGNANO", "TRIESTE"): 50,
-    # Default per città non censite (stima media FVG)
-    "DEFAULT": 20 
+# --- MOTORE DI CALCOLO DISTANZE (Base FVG/Veneto) ---
+# In questa fase usiamo un dizionario di distanze note. 
+# Se la città non è in lista, calcoliamo una media cautelativa di 25km.
+distanze_km = {
+    ("BASILIANO", "UDINE"): 13, ("BASILIANO", "CODROIPO"): 14,
+    ("BASILIANO", "TRIESTE"): 78, ("BASILIANO", "PORDENONE"): 45,
+    ("BASILIANO", "CERVIGNANO"): 35, ("BASILIANO", "LATISANA"): 32,
+    ("BASILIANO", "PALMANOVA"): 25, ("BASILIANO", "TAVAGNACCO"): 18,
+    ("UDINE", "TRIESTE"): 75, ("UDINE", "CERVIGNANO"): 30,
+    ("UDINE", "CODROIPO"): 25, ("CODROIPO", "LATISANA"): 20,
+    # Aggiungeremo altre tratte man mano che le città compaiono nei tuoi dati
 }
 
-def calcola_distanza(orig, dest):
-    orig = orig.upper().strip()
-    dest = dest.upper().strip()
-    if orig == dest: return 0
-    return distanze_db.get((orig, dest), distanze_db.get("DEFAULT"))
+def get_distanza(a, b):
+    a, b = a.upper().strip(), b.upper().strip()
+    if a == b: return 0
+    # Cerca la tratta (A->B o B->A)
+    dist = distanze_km.get((a, b)) or distanze_km.get((b, a))
+    return dist if dist else 25 # Media standard se non censita
 
-# --- FUNZIONI DI SUPPORTO ---
-
+# --- PARSING DATI ---
 @st.cache_data(ttl=3600)
-def load_data_from_drive(url):
+def load_data(url):
     try:
         r = requests.get(url)
         return r.text if r.status_code == 200 else None
     except: return None
 
-def parse_ics_locations(content):
+def parse_ics_km(content):
     if not content: return []
-    data = []
+    events = []
     lines = StringIO(content).readlines()
     in_event = False
-    current_event = {"summary": "", "dtstart": "", "location": ""}
-    
+    curr = {}
     for line in lines:
         line = line.strip()
         if line.startswith("BEGIN:VEVENT"):
             in_event = True
-            current_event = {"summary": "", "dtstart": "", "location": ""}
+            curr = {"summary": "", "dtstart": "", "location": ""}
         elif line.startswith("END:VEVENT"):
             in_event = False
-            # Estrazione città dalla location o dal summary
-            # Cerchiamo di pulire la stringa per avere solo il nome comune
-            loc = current_event["location"].split(",")[-1].strip().upper()
-            if not loc: # fallback su summary se location vuota
-                loc = "UDINE" # Default cautelativo
+            # Estraiamo la città (solitamente l'ultima parola della LOCATION)
+            loc_full = curr.get("location", "").replace("\\,", ",").split(",")
+            citta = loc_full[-1].strip().upper() if loc_full else "SCONOSCIUTO"
+            # Pulizia da CAP o parentesi
+            citta = ''.join([i for i in citta if not i.isdigit()]).replace("(", "").replace(")", "").strip()
             
-            raw_dt = current_event["dtstart"].split(":")[-1]
+            raw_dt = curr["dtstart"].split(":")[-1]
             if len(raw_dt) >= 8:
                 try:
                     dt = datetime.datetime.strptime(raw_dt[:15], "%Y%m%dT%H%M%S")
                     dt += datetime.timedelta(hours=(2 if 3 < dt.month < 10 else 1))
-                    data.append({
-                        "Data": dt.date(),
-                        "Ora": dt.time(),
-                        "Settimana": dt.isocalendar()[1],
-                        "Anno": dt.year,
-                        "Città": loc
+                    events.append({
+                        "Data": dt.date(), "Ora": dt.time(), "Settimana": dt.isocalendar()[1],
+                        "Città": citta if citta else "UDINE"
                     })
                 except: continue
         elif in_event:
-            if line.startswith("DTSTART"): current_event["dtstart"] = line
-            elif line.startswith("LOCATION"): current_event["location"] = line[9:]
-            elif line.startswith("SUMMARY"): current_event["summary"] = line[8:]
-    return data
+            if line.startswith("DTSTART"): curr["dtstart"] = line
+            elif line.startswith("LOCATION"): curr["location"] = line[9:]
+            elif line.startswith("SUMMARY"): curr["summary"] = line[8:]
+    return events
 
 # --- INTERFACCIA ---
-st.set_page_config(page_title="Logistica Chilometri 1.0", layout="wide")
+st.set_page_config(page_title="App Chilometri 1.0", layout="wide")
+st.title("🛣️ Monitoraggio Chilometrico Lavoro")
+st.markdown(f"Partenza e Rientro fissati a: **{CASA_BASE}**")
 
-st.title("🚗 Calcolo Chilometrico Settimanale")
-st.info(f"Punto di partenza e rientro: **{CASA_BASE}**")
+content = load_data(DRIVE_URL)
+data = parse_ics_km(content)
 
-content = load_data_from_drive(DRIVE_URL)
-raw_data = parse_ics_locations(content)
-
-if raw_data:
-    df = pd.DataFrame(raw_data)
-    sel_week = st.number_input("Seleziona Settimana:", 1, 53, datetime.date.today().isocalendar()[1])
+if data:
+    df = pd.DataFrame(data)
+    sel_week = st.number_input("Analisi Settimana:", 1, 53, datetime.date.today().isocalendar()[1])
     
-    df_week = df[df["Settimana"] == sel_week].sort_values(["Data", "Ora"])
+    # Filtro e ordinamento temporale (fondamentale per il giro visite)
+    df_w = df[df["Settimana"] == sel_week].sort_values(["Data", "Ora"])
     
-    if not df_week.empty:
-        giorni = df_week["Data"].unique()
-        km_totali_settimana = 0
+    if not df_w.empty:
+        giorni = df_w["Data"].unique()
+        tot_km_sett = 0
         
-        for giorno in giorni:
-            df_giorno = df_week[df_week["Data"] == giorno]
-            citta_tappa = df_giorno["Città"].tolist()
+        st.subheader(f"Riepilogo Settimana {sel_week}")
+        
+        for g in giorni:
+            tappe_giorno = df_w[df_w["Data"] == g]["Città"].tolist()
+            # Costruiamo il percorso: Casa -> Tappa 1 -> Tappa 2 -> Casa
+            itinerario = [CASA_BASE] + tappe_giorno + [CASA_BASE]
             
-            # Costruzione Percorso: Casa -> Tappe -> Casa
-            percorso = [CASA_BASE] + citta_tappa + [CASA_BASE]
+            km_g = 0
+            for i in range(len(itinerario) - 1):
+                km_g += get_distanza(itinerario[i], itinerario[i+1])
             
-            km_giorno = 0
-            for i in range(len(percorso) - 1):
-                km_giorno += calcola_distanza(percorso[i], percorso[i+1])
+            tot_km_sett += km_g
             
-            km_totali_settimana += km_giorno
-            
-            with st.expander(f"📅 {giorno.strftime('%A %d/%m')} - Totale: {km_giorno} km"):
-                st.write(f"**Percorso:** {' ➔ '.join(percorso)}")
-                st.write(f"Numero tappe: {len(citta_tappa)}")
+            # Visualizzazione a "Card"
+            with st.expander(f"📅 {g.strftime('%A %d/%m')} — {km_g} km"):
+                st.write("**Percorso della giornata:**")
+                st.write(" ➔ ".join(itinerario))
+                st.caption("Il calcolo include il rientro a Basiliano dopo l'ultima tappa.")
 
-        st.metric(" Chilometri Totali Settimana", f"{km_totali_settimana} km")
+        st.divider()
+        c1, c2 = st.columns(2)
+        c1.metric("Totale Chilometri", f"{tot_km_sett} km")
+        c2.metric("Media Giornaliera", f"{round(tot_km_sett/len(giorni), 1)} km")
         
-        # Grafico semplice
-        st.bar_chart(df_week.groupby("Data").size())
     else:
-        st.warning("Nessun dato per questa settimana.")
+        st.warning("Nessun appuntamento trovato per questa settimana.")
+else:
+    st.error("Errore nel caricamento dei dati da Google Drive.")
