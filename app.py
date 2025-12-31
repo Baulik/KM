@@ -1,32 +1,47 @@
-# VERSIONE: 1.7 (OTTIMIZZAZIONE RICERCA LOCALITÀ E SINTESI KM)
+# VERSIONE: 3.0 (CHILOMETRI - Calcolo Stradale Dinamico OSRM)
 import streamlit as st
 import pandas as pd
 import datetime
 import requests
 from io import StringIO
 import re
+import math
 
 # --- CONFIGURAZIONE ---
-CASA_BASE = "BASILIANO"
+CASA_BASE = "BASILIANO, UD, FRIULI VENEZIA GIULIA"
 DRIVE_URL = "https://drive.google.com/uc?export=download&id=1n4b33BgWxIUDWm4xuDnhjICPkqGWi2po"
 
-# --- DATABASE DISTANZE (FVG/VENETO) ---
-distanze_km = {
-    ("BASILIANO", "UDINE"): 13, ("BASILIANO", "GORIZIA"): 42,
-    ("BASILIANO", "SAGRADO"): 38, ("BASILIANO", "PORDENONE"): 45,
-    ("BASILIANO", "CODROIPO"): 14, ("BASILIANO", "TRIESTE"): 78,
-    ("UDINE", "GORIZIA"): 28, ("SAGRADO", "PORDENONE"): 75,
-    ("UDINE", "CERVIGNANO"): 30, ("BASILIANO", "CERVIGNANO"): 35,
-}
+# --- MOTORE GEOGRAFICO (OSRM + NOMINATIM) ---
+@st.cache_data(ttl=86400) # Cache di 24 ore per le coordinate
+def get_coords(citta):
+    """Ricava Latitudine e Longitudine di un comune"""
+    try:
+        url = f"https://nominatim.openstreetmap.org/search?city={citta}&format=json&limit=1"
+        headers = {'User-Agent': 'MonitorChilometriApp/1.0'}
+        r = requests.get(url, headers=headers)
+        if r.status_code == 200 and len(r.json()) > 0:
+            return r.json()[0]['lat'], r.json()[0]['lon']
+    except:
+        return None
+    return None
 
-def get_distanza(a, b):
-    a, b = a.upper().strip(), b.upper().strip()
-    if a == b: return 0
-    # Cerca la combinazione nel DB (in entrambi i sensi)
-    dist = distanze_km.get((a, b)) or distanze_km.get((b, a))
-    return dist if dist else 25 # Media standard se la città è nuova
+@st.cache_data(ttl=86400)
+def get_road_distance(points):
+    """Calcola la distanza stradale reale tra una lista di coordinate"""
+    if len(points) < 2: return 0
+    coords_str = ";".join([f"{p[1]},{p[0]}" for p in points]) # OSRM vuole lon,lat
+    try:
+        url = f"http://router.project-osrm.org/route/v1/driving/{coords_str}?overview=false"
+        r = requests.get(url)
+        if r.status_code == 200:
+            data = r.json()
+            # Distanza restituita in metri, convertiamo in km
+            return round(data['routes'][0]['distance'] / 1000, 1)
+    except:
+        return 0
+    return 0
 
-# --- LOGICA DI ESTRAZIONE ---
+# --- PARSING DATI (STESSA LOGICA AGENDA) ---
 @st.cache_data(ttl=600)
 def load_data(url):
     try:
@@ -34,31 +49,22 @@ def load_data(url):
         return r.text if r.status_code == 200 else None
     except: return None
 
-def extract_city(description, summary):
-    """Cerca la città nei campi dell'appuntamento"""
-    full_text = f"{summary} {description}".replace("\\,", ",").replace("\n", " ")
-    
-    # 1. Prova con etichette esplicite
+def extract_city(description):
+    text_clean = description.replace("\\,", ",").replace("\n", " ")
     for tag in ["Frazione:", "Città:", "Citta:", "Località:"]:
-        pattern = re.compile(f"{tag}\s*([^,;:\n]*)", re.IGNORECASE)
-        match = pattern.search(full_text)
-        if match and match.group(1).strip():
-            return match.group(1).strip().upper()
-    
-    # 2. Fallback: se il titolo contiene un trattino, spesso la città è l'ultima parte
-    if "-" in summary:
-        parts = summary.split("-")
-        return parts[-1].strip().upper()
-        
+        if tag.lower() in text_clean.lower():
+            pattern = re.compile(f"{tag}\s*([^,;:\n]*)", re.IGNORECASE)
+            match = pattern.search(text_clean)
+            if match and match.group(1).strip():
+                return match.group(1).strip().upper()
     return ""
 
-def parse_ics_km_v17(content):
+def parse_ics_km_v3(content):
     if not content: return []
     events = []
     lines = StringIO(content).readlines()
     in_event = False
     curr = {"summary": "", "description": "", "dtstart": ""}
-    
     for line in lines:
         line = line.strip()
         if line.startswith("BEGIN:VEVENT"):
@@ -66,20 +72,17 @@ def parse_ics_km_v17(content):
             curr = {"summary": "", "description": "", "dtstart": ""}
         elif line.startswith("END:VEVENT"):
             in_event = False
-            full_text = (curr["summary"] + " " + curr["description"]).lower()
-            
-            # FILTRO: Deve essere un appuntamento di lavoro (Nominativo)
-            if "nominativo" in full_text:
-                citta = extract_city(curr["description"], curr["summary"])
-                
+            desc_lower = (curr["summary"] + " " + curr["description"]).lower()
+            if "nominativo" in desc_lower and "codice fiscale" in desc_lower:
                 raw_dt = curr["dtstart"].split(":")[-1]
                 if len(raw_dt) >= 8:
                     try:
                         dt = datetime.datetime.strptime(raw_dt[:15], "%Y%m%dT%H%M%S")
                         dt += datetime.timedelta(hours=(2 if 3 < dt.month < 10 else 1))
-                        
-                        # Solo dal 2024 in poi
                         if dt.year >= 2024:
+                            citta = extract_city(curr["description"])
+                            if not citta and "-" in curr["summary"]:
+                                citta = curr["summary"].split("-")[-1].strip().upper()
                             events.append({
                                 "Data": dt.date(), "Ora": dt.time(), 
                                 "Settimana": dt.isocalendar()[1], "Mese": dt.month,
@@ -93,66 +96,50 @@ def parse_ics_km_v17(content):
     return events
 
 # --- INTERFACCIA ---
-st.set_page_config(page_title="KM Monitor 1.7", layout="wide")
-st.title("🚗 Riepilogo Chilometraggio Lavoro")
+st.set_page_config(page_title="KM Real-Time 3.0", layout="wide")
+st.title("🛣️ Monitoraggio Chilometri Reali (OSRM)")
 
 content = load_data(DRIVE_URL)
-data = parse_ics_km_v17(content)
+data = parse_ics_km_v3(content)
 
 if data:
     df = pd.DataFrame(data)
-    
-    # Selettore Settimana
-    sel_week = st.sidebar.number_input("Seleziona Settimana:", 1, 53, datetime.date.today().isocalendar()[1])
-    df_w = df[df["Settimana"] == sel_week]
-    
-    if not df_w.empty:
-        # Mostra Anni in colonne (es. 2024 e 2025 affiancati)
-        anni = sorted(df_w["Anno"].unique())
+    sel_week = st.number_input("Seleziona Settimana", 1, 53, datetime.date.today().isocalendar()[1])
+    df_week = df[df["Settimana"] == sel_week]
+
+    if not df_week.empty:
+        anni = sorted(df_week["Anno"].unique())
         cols = st.columns(len(anni))
         
+        # Coordinate fisse di Basiliano
+        coords_casa = get_coords("BASILIANO")
+
         for i, anno in enumerate(anni):
             with cols[i]:
-                st.markdown(f"### 📅 Anno {anno}")
-                df_a = df_w[df_w["Anno"] == anno].sort_values(["Data", "Ora"])
-                
+                st.header(f"📅 {anno}")
+                df_a = df_week[df_week["Anno"] == anno].sort_values(["Data", "Ora"])
                 tot_km_sett = 0
-                giorni = df_a["Data"].unique()
                 
-                for g in giorni:
-                    tappe = df_a[df_a["Data"] == g]["Città"].tolist()
-                    percorso = [CASA_BASE] + tappe + [CASA_BASE]
+                for g in df_a["Data"].unique():
+                    tappe_nomi = df_a[df_a["Data"] == g]["Città"].tolist()
                     
-                    # Calcolo km del giorno
-                    km_g = sum(get_distanza(percorso[j], percorso[j+1]) for j in range(len(percorso)-1))
+                    # Convertiamo nomi città in coordinate
+                    tappe_coords = [coords_casa]
+                    for t in tappe_nomi:
+                        c = get_coords(t)
+                        if c: tappe_coords.append(c)
+                    tappe_coords.append(coords_casa)
+                    
+                    # Calcolo distanza reale
+                    km_g = get_road_distance(tappe_coords)
                     tot_km_sett += km_g
                     
-                    # Visualizzazione pulita con expander per il dettaglio
-                    with st.expander(f"**{g.strftime('%a %d/%m')}**: {km_g} km"):
-                        st.write(f"🚩 Giro: {' ➔ '.join(percorso)}")
+                    with st.expander(f"**{g.strftime('%d/%m')}**: {km_g} km"):
+                        st.write(f"Percorso: Basiliano ➔ {' ➔ '.join(tappe_nomi)} ➔ Basiliano")
                 
-                st.metric(f"Totale Settimana {sel_week}", f"{tot_km_sett} km")
-    else:
-        st.info(f"Nessun dato per la settimana {sel_week}")
-
-    # --- TABELLA STORICA MENSILE ---
-    st.divider()
-    st.subheader("📊 Confronto Chilometri Mensili")
-    storico = []
-    for (anno, mese), group in df.groupby(["Anno", "Mese"]):
-        km_m = 0
-        for g in group["Data"].unique():
-            t = group[group["Data"] == g]["Città"].tolist()
-            iti = [CASA_BASE] + t + [CASA_BASE]
-            km_m += sum(get_distanza(iti[j], iti[j+1]) for j in range(len(iti)-1))
-        storico.append({"Anno": anno, "Mese": mese, "Km": km_m})
+                st.metric(f"Totale {anno}", f"{tot_km_sett} km")
     
-    if storico:
-        df_h = pd.DataFrame(storico)
-        mesi_it = {1:"Gen", 2:"Feb", 3:"Mar", 4:"Apr", 5:"Mag", 6:"Giu", 7:"Lug", 8:"Ago", 9:"Set", 10:"Ott", 11:"Nov", 12:"Dic"}
-        pivot = df_h.pivot(index="Mese", columns="Anno", values="Km").fillna(0).astype(int)
-        pivot.index = pivot.index.map(mesi_it)
-        st.dataframe(pivot.style.background_gradient(cmap="YlGn"), use_container_width=True)
-
+    st.divider()
+    st.info("Nota: Le distanze sono calcolate tramite itinerari stradali reali (OSRM).")
 else:
-    st.error("Dati non trovati. Verifica che il file Drive sia accessibile.")
+    st.warning("Dati non trovati.")
