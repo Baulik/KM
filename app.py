@@ -1,4 +1,4 @@
-# VERSIONE: 3.2 (CHILOMETRI - Multi-Database CSV Friuli & Veneto)
+# VERSIONE: 2.3 (CHILOMETRI - Fix KeyError & Unificazione Database)
 import streamlit as st
 import pandas as pd
 import datetime
@@ -10,61 +10,44 @@ import re
 CASA_BASE = "BASILIANO"
 DRIVE_URL = "https://drive.google.com/uc?export=download&id=1n4b33BgWxIUDWm4xuDnhjICPkqGWi2po"
 
-# --- CARICAMENTO DATABASE COMUNI ---
-@st.cache_data
-def load_full_db():
-    try:
-        # Carica Friuli
-        df_f = pd.read_csv("friuli.csv")
-        # Carica Veneto
-        df_v = pd.read_csv("veneto.csv")
-        
-        # Unisce i due database
-        df_full = pd.concat([df_f, df_v], ignore_index=True)
-        df_full['comune'] = df_full['comune'].str.upper().str.strip()
-        
-        # Rimuove eventuali duplicati e crea il dizionario delle coordinate
-        return pd.Series(list(zip(df_full.lat, df_full.lon)), index=df_full.comune).to_dict()
-    except Exception as e:
-        st.error(f"Errore nel caricamento dei file CSV: {e}")
-        return {"BASILIANO": (46.01, 13.10), "UDINE": (46.06, 13.24)}
+# --- DATABASE UNIFICATO (FVG + VENETO) ---
+# Usiamo un unico nome (DB_MAPPA) per evitare errori di riferimento
+DB_MAPPA = {
+    "BASILIANO": (46.01, 13.10), "UDINE": (46.06, 13.24), "PORDENONE": (45.95, 12.66), 
+    "GORIZIA": (45.94, 13.62), "TRIESTE": (45.65, 13.77), "SAGRADO": (45.87, 13.48), 
+    "CODROIPO": (45.96, 12.97), "LATISANA": (45.78, 13.00), "CERVIGNANO": (45.82, 13.33), 
+    "PALMANOVA": (45.90, 13.31), "TAVAGNACCO": (46.12, 13.21), "MARTIGNACCO": (46.10, 13.13),
+    "GEMONA": (46.27, 13.13), "TOLMEZZO": (46.40, 13.02), "SACILE": (45.95, 12.50),
+    "SPILIMBERGO": (46.11, 12.90), "SAN DANIELE": (46.16, 13.01), "MONFALCONE": (45.81, 13.53),
+    "CORMONS": (45.91, 13.47), "GRADISCA": (45.89, 13.47), "RONCHI": (45.82, 13.50),
+    "MANZANO": (45.99, 13.38), "BUTTRIO": (46.01, 13.33), "SAN GIORGIO": (45.82, 13.20),
+    "REANA": (46.13, 13.23), "POZZUOLO": (45.98, 13.19), "CAMPOFORMIDO": (46.01, 13.15),
+    "PORTOGRUARO": (45.77, 12.83), "CONCORDIA SAGITTARIA": (45.75, 12.84), "SAN DONA": (45.63, 12.56),
+    "JESOLO": (45.53, 12.64), "CAORLE": (45.59, 12.88), "TREVISO": (45.66, 12.24), 
+    "MIRANO": (45.49, 12.11), "SPINEA": (45.49, 12.16), "VENEZIA": (45.44, 12.31),
+    "MESTRE": (45.49, 12.24), "NOALE": (45.55, 12.07), "MARTELLAGO": (45.54, 12.15),
+    "PADOVA": (45.40, 11.87), "VICENZA": (45.54, 11.54), "VERONA": (45.43, 10.99),
+    "CONEGLIANO": (45.88, 12.29), "ODERZO": (45.78, 12.49), "CASTELFRANCO": (45.67, 11.92),
+    "VITTORIO VENETO": (45.99, 12.29), "MONTEBELLUNA": (45.77, 12.04), "MOGLIANO": (45.56, 12.24)
+}
 
-DB_COORDS = load_full_db()
-
-# --- LOGICA DI PULIZIA E RICERCA ---
-
-def pulisci_ics_text(testo_grezzo):
-    """Sana i testi spezzati da Google ICS"""
-    testo = testo_grezzo.replace("\n ", "").replace("\r ", "")
-    testo = testo.replace("\\n", " ").replace("\\,", ",")
-    return testo
-
-def estrai_citta_intelligente(testo_pulito):
-    """Radar di ricerca: cerca match esatti nel database partendo dai nomi più lunghi"""
-    testo_up = testo_pulito.upper()
-    
-    # Priorità 1: Cerca il valore dopo l'etichetta 'Città'
-    match = re.search(r"CITTÀ\s+([A-ZÀ-Ú][a-zà-ú]+(?:\s[A-ZÀ-Ú][a-zà-ú]+)*)", testo_up)
-    if match:
-        citta_potenziale = match.group(1).strip()
-        if citta_potenziale in DB_COORDS:
-            return citta_potenziale
-
-    # Priorità 2: Scansione Radar su tutto il testo (per i nomi composti come 'SESTO AL REGHENA')
-    # Ordiniamo le chiavi per lunghezza decrescente per evitare match parziali
-    for comune in sorted(DB_COORDS.keys(), key=len, reverse=True):
+def identifica_comune_sicuro(testo):
+    """Cerca il comune nel testo, restituisce UDINE se non trova nulla"""
+    testo_up = testo.upper()
+    for comune in sorted(DB_MAPPA.keys(), key=len, reverse=True):
         if comune in testo_up:
             return comune
-            
-    return "UDINE" # Fallback standard
+    return "UDINE"
 
 @st.cache_data(ttl=86400)
 def calcola_distanza_osrm(nomi_tappe):
-    """Calcola l'itinerario stradale reale"""
-    punti = [DB_COORDS.get(n, DB_COORDS["UDINE"]) for n in nomi_tappe]
+    """Calcola distanza stradale reale. Protezione KeyError integrata."""
+    # Trasforma i nomi in coordinate, usando Udine come fallback sicuro
+    punti = [DB_MAPPA.get(n, DB_MAPPA["UDINE"]) for n in nomi_tappe]
+    
     if len(punti) < 2: return 0
     
-    # Formato OSRM: lon,lat
+    # Formato lon,lat per OSRM
     locs = ";".join([f"{p[1]},{p[0]}" for p in punti])
     try:
         url = f"http://router.project-osrm.org/route/v1/driving/{locs}?overview=false"
@@ -75,71 +58,78 @@ def calcola_distanza_osrm(nomi_tappe):
         return 0
     return 0
 
-# --- PARSING CALENDARIO ---
-
-def parse_ics_v32(content):
+# --- MOTORE PARSING ---
+def parse_ics_km_v23(content):
     if not content: return []
-    events = []
-    # Rimuove i salti riga che spezzano le parole
-    content_fixed = content.replace("\r\n ", "").replace("\n ", "")
-    
-    segments = content_fixed.split("BEGIN:VEVENT")
-    for seg in segments:
-        if "END:VEVENT" in seg:
-            # Data inizio
-            start_match = re.search(r"DTSTART:(\d{8})", seg)
-            if start_match:
-                dt = datetime.datetime.strptime(start_match.group(1), "%Y%m%d")
-                
-                # Estrazione corpo testo
-                summary_match = re.search(r"SUMMARY:(.*?)TRANSP:", seg, re.DOTALL)
-                text = pulisci_ics_text(summary_match.group(1)) if summary_match else ""
-                
-                # Filtro: Solo appuntamenti con Nominativo
-                if "NOMINATIVO" in text.upper():
-                    citta = estrai_citta_intelligente(text)
-                    events.append({
-                        "Data": dt.date(),
-                        "Settimana": dt.isocalendar()[1],
-                        "Anno": dt.year,
-                        "Città": citta
-                    })
-    return events
-
-# --- INTERFACCIA STREAMLIT ---
-
-st.set_page_config(page_title="KM Monitor 3.2", layout="wide")
-st.title("🚗 Monitor Chilometri FVG & Veneto")
-
-try:
-    response = requests.get(DRIVE_URL)
-    data = parse_ics_v32(response.text) if response.status_code == 200 else []
-except:
     data = []
+    lines = StringIO(content).readlines()
+    in_event = False
+    curr = {"summary": "", "description": "", "dtstart": ""}
+    for line in lines:
+        line = line.strip()
+        if line.startswith("BEGIN:VEVENT"):
+            in_event = True
+            curr = {"summary": "", "description": "", "dtstart": ""}
+        elif line.startswith("END:VEVENT"):
+            in_event = False
+            full_text = f"{curr['summary']} {curr['description']}".upper()
+            if "NOMINATIVO" in full_text and "CODICE FISCALE" in full_text:
+                raw_dt = curr["dtstart"].split(":")[-1]
+                try:
+                    dt = datetime.datetime.strptime(raw_dt[:15], "%Y%m%dT%H%M%S")
+                    dt += datetime.timedelta(hours=(2 if 3 < dt.month < 10 else 1))
+                    if dt.year >= 2024:
+                        comune_rilevato = identifica_comune_sicuro(full_text)
+                        data.append({
+                            "Data": dt.date(), "Settimana": dt.isocalendar()[1], "Anno": dt.year,
+                            "Ora": dt.time(), "Comune": comune_rilevato
+                        })
+                except: continue
+        elif in_event:
+            if line.startswith("DTSTART"): curr["dtstart"] = line
+            elif line.startswith("SUMMARY"): curr["summary"] = line[8:]
+            elif line.startswith("DESCRIPTION"): curr["description"] += line[12:]
+    return data
 
-if data:
-    df = pd.DataFrame(data)
-    sel_week = st.number_input("Seleziona Settimana", 1, 53, datetime.date.today().isocalendar()[1])
+# --- INTERFACCIA ---
+st.set_page_config(page_title="KM App 2.3", layout="wide")
+st.title("🛣️ Monitoraggio Chilometri (Stabile)")
+
+@st.cache_data(ttl=600)
+def fetch_data():
+    try:
+        r = requests.get(DRIVE_URL)
+        return parse_ics_km_v23(r.text) if r.status_code == 200 else []
+    except:
+        return []
+
+events = fetch_data()
+
+if events:
+    df = pd.DataFrame(events)
+    sel_week = st.number_input("Settimana", 1, 53, datetime.date.today().isocalendar()[1])
     df_w = df[df["Settimana"] == sel_week]
     
     if not df_w.empty:
-        for anno in sorted(df_w["Anno"].unique()):
-            st.subheader(f"📅 Anno {anno}")
-            df_a = df_w[df_w["Anno"] == anno].sort_values("Data")
-            tot_km_anno = 0
-            
-            for g in df_a["Data"].unique():
-                tappe = df_a[df_a["Data"] == g]["Città"].tolist()
-                # Costruisce il giro: Casa -> Tappe -> Casa
-                percorso = [CASA_BASE] + tappe + [CASA_BASE]
-                dist = calcola_distanza_osrm(percorso)
-                tot_km_anno += dist
-                
-                with st.expander(f"**{g.strftime('%d/%m')}**: {dist} km"):
-                    st.write(f"🚩 Percorso: {' ➔ '.join(percorso)}")
-            
-            st.metric(f"Totale Settimanale {anno}", f"{round(tot_km_anno, 1)} km")
+        anni = sorted(df_w["Anno"].unique())
+        cols = st.columns(len(anni))
+        for i, anno in enumerate(anni):
+            with cols[i]:
+                st.header(f"📅 {anno}")
+                df_a = df_w[df_w["Anno"] == anno].sort_values(["Data", "Ora"])
+                tot_km = 0
+                for g in df_a["Data"].unique():
+                    tappe = df_a[df_a["Data"] == g]["Comune"].tolist()
+                    percorso = ["BASILIANO"] + tappe + ["BASILIANO"]
+                    
+                    # Chiamata alla funzione sicura
+                    km_giorno = calcola_distanza_osrm(percorso)
+                    tot_km += km_giorno
+                    
+                    with st.expander(f"**{g.strftime('%d/%m')}**: {km_giorno} km"):
+                        st.write(f"Giro: {' ➔ '.join(percorso)}")
+                st.metric(f"Totale Settimana", f"{round(tot_km,1)} km")
     else:
-        st.info(f"Nessun appuntamento trovato per la settimana {sel_week}")
+        st.info("Nessun dato per questa settimana.")
 else:
-    st.error("Dati non caricati. Verifica la connessione o i file CSV.")
+    st.error("Nessun dato trovato o errore di connessione.")
