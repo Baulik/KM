@@ -1,17 +1,17 @@
-# VERSIONE: 2.3 (CHILOMETRI - Fix KeyError & Unificazione Database)
+# VERSIONE: 2.4 (CHILOMETRI - Ricerca Flessibile & Pulizia Testo)
 import streamlit as st
 import pandas as pd
 import datetime
 import requests
 from io import StringIO
 import re
+import unicodedata
 
 # --- CONFIGURAZIONE ---
 CASA_BASE = "BASILIANO"
 DRIVE_URL = "https://drive.google.com/uc?export=download&id=1n4b33BgWxIUDWm4xuDnhjICPkqGWi2po"
 
 # --- DATABASE UNIFICATO (FVG + VENETO) ---
-# Usiamo un unico nome (DB_MAPPA) per evitare errori di riferimento
 DB_MAPPA = {
     "BASILIANO": (46.01, 13.10), "UDINE": (46.06, 13.24), "PORDENONE": (45.95, 12.66), 
     "GORIZIA": (45.94, 13.62), "TRIESTE": (45.65, 13.77), "SAGRADO": (45.87, 13.48), 
@@ -31,35 +31,40 @@ DB_MAPPA = {
     "VITTORIO VENETO": (45.99, 12.29), "MONTEBELLUNA": (45.77, 12.04), "MOGLIANO": (45.56, 12.24)
 }
 
+def pulisci_testo(testo):
+    """Rimuove accenti e rende tutto maiuscolo per facilitare il confronto"""
+    if not testo: return ""
+    testo = testo.upper()
+    # Rimuove accenti (es. à -> a)
+    testo = ''.join(c for c in unicodedata.normalize('NFD', testo) if unicodedata.category(c) != 'Mn')
+    # Sostituisce l'apostrofo con lo spazio per nomi tipo San Dona'
+    testo = testo.replace("'", " ").replace("-", " ")
+    return testo
+
 def identifica_comune_sicuro(testo):
-    """Cerca il comune nel testo, restituisce UDINE se non trova nulla"""
-    testo_up = testo.upper()
+    """Cerca il comune nel testo pulito"""
+    testo_pulito = pulisci_testo(testo)
+    # Cerca prima i nomi più lunghi
     for comune in sorted(DB_MAPPA.keys(), key=len, reverse=True):
-        if comune in testo_up:
+        comune_pulito = pulisci_testo(comune)
+        if comune_pulito in testo_pulito:
             return comune
     return "UDINE"
 
 @st.cache_data(ttl=86400)
 def calcola_distanza_osrm(nomi_tappe):
-    """Calcola distanza stradale reale. Protezione KeyError integrata."""
-    # Trasforma i nomi in coordinate, usando Udine come fallback sicuro
     punti = [DB_MAPPA.get(n, DB_MAPPA["UDINE"]) for n in nomi_tappe]
-    
     if len(punti) < 2: return 0
-    
-    # Formato lon,lat per OSRM
     locs = ";".join([f"{p[1]},{p[0]}" for p in punti])
     try:
         url = f"http://router.project-osrm.org/route/v1/driving/{locs}?overview=false"
         r = requests.get(url, timeout=10)
         if r.status_code == 200:
             return round(r.json()['routes'][0]['distance'] / 1000, 1)
-    except:
-        return 0
+    except: return 0
     return 0
 
-# --- MOTORE PARSING ---
-def parse_ics_km_v23(content):
+def parse_ics_km_v24(content):
     if not content: return []
     data = []
     lines = StringIO(content).readlines()
@@ -72,17 +77,18 @@ def parse_ics_km_v23(content):
             curr = {"summary": "", "description": "", "dtstart": ""}
         elif line.startswith("END:VEVENT"):
             in_event = False
-            full_text = f"{curr['summary']} {curr['description']}".upper()
-            if "NOMINATIVO" in full_text and "CODICE FISCALE" in full_text:
+            # Uniamo i campi per la ricerca
+            full_text = f"{curr['summary']} {curr['description']}"
+            if "nominativo" in full_text.lower() and "codice fiscale" in full_text.lower():
                 raw_dt = curr["dtstart"].split(":")[-1]
                 try:
                     dt = datetime.datetime.strptime(raw_dt[:15], "%Y%m%dT%H%M%S")
                     dt += datetime.timedelta(hours=(2 if 3 < dt.month < 10 else 1))
                     if dt.year >= 2024:
-                        comune_rilevato = identifica_comune_sicuro(full_text)
+                        comune = identifica_comune_sicuro(full_text)
                         data.append({
                             "Data": dt.date(), "Settimana": dt.isocalendar()[1], "Anno": dt.year,
-                            "Ora": dt.time(), "Comune": comune_rilevato
+                            "Ora": dt.time(), "Comune": comune
                         })
                 except: continue
         elif in_event:
@@ -92,22 +98,21 @@ def parse_ics_km_v23(content):
     return data
 
 # --- INTERFACCIA ---
-st.set_page_config(page_title="KM App 2.3", layout="wide")
-st.title("🛣️ Monitoraggio Chilometri (Stabile)")
+st.set_page_config(page_title="KM Monitor 2.4", layout="wide")
+st.title("🛣️ Monitoraggio Chilometri (Ricerca Avanzata)")
 
 @st.cache_data(ttl=600)
 def fetch_data():
     try:
         r = requests.get(DRIVE_URL)
-        return parse_ics_km_v23(r.text) if r.status_code == 200 else []
-    except:
-        return []
+        return parse_ics_km_v24(r.text) if r.status_code == 200 else []
+    except: return []
 
 events = fetch_data()
 
 if events:
     df = pd.DataFrame(events)
-    sel_week = st.number_input("Settimana", 1, 53, datetime.date.today().isocalendar()[1])
+    sel_week = st.number_input("Seleziona Settimana", 1, 53, datetime.date.today().isocalendar()[1])
     df_w = df[df["Settimana"] == sel_week]
     
     if not df_w.empty:
@@ -121,15 +126,12 @@ if events:
                 for g in df_a["Data"].unique():
                     tappe = df_a[df_a["Data"] == g]["Comune"].tolist()
                     percorso = ["BASILIANO"] + tappe + ["BASILIANO"]
-                    
-                    # Chiamata alla funzione sicura
                     km_giorno = calcola_distanza_osrm(percorso)
                     tot_km += km_giorno
-                    
                     with st.expander(f"**{g.strftime('%d/%m')}**: {km_giorno} km"):
-                        st.write(f"Giro: {' ➔ '.join(percorso)}")
-                st.metric(f"Totale Settimana", f"{round(tot_km,1)} km")
+                        st.write(f"Tappe trovate: {' ➔ '.join(tappe)}")
+                st.metric(f"Totale {anno}", f"{round(tot_km,1)} km")
     else:
-        st.info("Nessun dato per questa settimana.")
+        st.info("Nessun appuntamento trovato per questa settimana.")
 else:
     st.error("Nessun dato trovato o errore di connessione.")
